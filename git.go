@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strconv"
@@ -53,8 +54,7 @@ func (t *TempDir) CleanTempDir() (err error) {
 type KeyPath string
 
 // SetupGitSSHPubKeys fetches SSH public keys based on the key path
-func (k KeyPath) SetupGitSSHPubKeys() (pubKeys *gitSSH.PublicKeys, err error) {
-
+func (k KeyPath) SetupGitSSHPubKeys() (*gitSSH.PublicKeys, error) {
 	pem, err := ioutil.ReadFile(string(k))
 	if err != nil {
 		return &gitSSH.PublicKeys{}, err
@@ -79,17 +79,28 @@ type GitRepo struct {
 	CommitMsg             string
 	Dir                   string
 	Namespace             string
+	Repo                  *git.Repository
 	SSHKey                *gitSSH.PublicKeys
 	SSHURL                string
 	InitialTargetRevision string
 	TempDir               string
 	VCSClient             interface{} // This package only supports GitLab at the moment
+	Worktree              *git.Worktree
+}
+
+// NewGitRepo returns a GitRepo with the minimum configs required for using the struct
+func NewGitRepo(repoDir, repoURL string, sshKey *gitSSH.PublicKeys) GitRepo {
+	return GitRepo{
+		Dir:    repoDir,
+		SSHKey: sshKey,
+		SSHURL: repoURL,
+	}
 }
 
 // Clone uses a given reference name to clone a Git repo
-func (gr GitRepo) Clone(ref plumbing.ReferenceName) (repo *git.Repository, err error) {
+func (gr GitRepo) Clone(ref plumbing.ReferenceName) (*git.Repository, error) {
 	// Clones the repository into the given dir, just as a normal git clone does
-	repo, err = git.PlainClone(gr.Dir, false, &git.CloneOptions{
+	repo, err := git.PlainClone(gr.Dir, false, &git.CloneOptions{
 		Auth:          gr.SSHKey,
 		URL:           gr.SSHURL,
 		ReferenceName: ref,
@@ -98,37 +109,108 @@ func (gr GitRepo) Clone(ref plumbing.ReferenceName) (repo *git.Repository, err e
 	return repo, err
 }
 
-// NewBranch creates a new branch on the provided repo
-func (gr GitRepo) NewBranch(repo *git.Repository, name string) (newBranch string, wt *git.Worktree, err error) {
-	now := time.Now()
-	epochTs := strconv.FormatInt(now.Unix(), 10)
-
-	newBranch = strings.Replace(name, " ", "-", -1) + "-" + epochTs
-	newBranchRefName := plumbing.NewBranchReferenceName(newBranch)
-
-	wt, err = repo.Worktree()
-	err = wt.Checkout(&git.CheckoutOptions{
-		Branch: newBranchRefName,
-		Create: true,
-		Keep:   true,
-	})
-
-	return newBranch, wt, err
-}
-
 // CommitAll staged all changes on the provided Worktree
-func (gr GitRepo) CommitAll(wt *git.Worktree, commitMsg string) (hash plumbing.Hash, err error) {
-	hash, err = wt.Commit(commitMsg, &git.CommitOptions{
+func (gr GitRepo) CommitAll(wt *git.Worktree, commitMsg string) (plumbing.Hash, error) {
+	hash, err := wt.Commit(commitMsg, &git.CommitOptions{
 		All: true,
 	})
 	return hash, err
 }
 
+// Init uses the stored git repo directory info to initialize a new repo
+func (gr GitRepo) Init(isBare bool) error {
+	repo, err := git.PlainInit(gr.Dir, isBare)
+	if err != nil {
+		return err
+	}
+	gr.Repo = repo
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+	gr.Worktree = wt
+
+	return nil
+}
+
+// InitAndPushNewRepo does a full init, commit, and push to the main branch
+func (gr GitRepo) InitAndPushNewRepo(commitMsg string) error {
+	repo, err := git.PlainInit(gr.Dir, false)
+	if err != nil {
+		return err
+	}
+	gr.Repo = repo
+
+	_, err = gr.NewBranch("main", false)
+	if err != nil {
+		return err
+	}
+
+	initFiles := []string{".gitignore", "CODEOWNERS"}
+	for _, fileName := range initFiles {
+		f := fmt.Sprintf("%s/%s", gr.Dir, fileName)
+		yes, err := fileExists(f)
+		if err != nil {
+			return err
+		}
+		if yes {
+			gr.Worktree.Add(f)
+		}
+	}
+
+	_, err = gr.Worktree.Commit(commitMsg, &git.CommitOptions{All: false})
+	if err != nil {
+		return err
+	}
+
+	err = gr.Push()
+
+	return err
+}
+
+// NewBranch creates a new branch on the provided repo
+func (gr GitRepo) NewBranch(name string, uniqSuffix bool) (string, error) {
+	newBranch := strings.Replace(name, " ", "-", -1)
+
+	if uniqSuffix {
+		now := time.Now()
+		epochTs := strconv.FormatInt(now.Unix(), 10)
+		newBranch = newBranch + "-" + epochTs
+	}
+
+	newBranchRefName := plumbing.NewBranchReferenceName(newBranch)
+
+	wt, err := gr.Repo.Worktree()
+	if err != nil {
+		return newBranch, err
+	}
+	gr.Worktree = wt
+
+	err = gr.Worktree.Checkout(&git.CheckoutOptions{
+		Branch: newBranchRefName,
+		Create: true,
+		Keep:   true,
+	})
+
+	return newBranch, err
+}
+
 // Push sends all staged commits to the default remotes of the provided repo
-func (gr GitRepo) Push(repo *git.Repository) (err error) {
-	repo.Push(&git.PushOptions{
+func (gr GitRepo) Push() error {
+	err := gr.Repo.Push(&git.PushOptions{
 		Auth:       gr.SSHKey,
 		RemoteName: defaultRemoteName,
 	})
 	return err
+}
+
+func fileExists(f string) (bool, error) {
+	_, err := os.Stat(f)
+	if os.IsNotExist(err) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	return false, nil
 }
