@@ -1,4 +1,4 @@
-module github.com/tochukwuvictor/go-gitHelpers
+module github.com/tochukwuvictor/go-githelpers
 
 go 1.14
 
