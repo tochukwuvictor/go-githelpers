@@ -18,6 +18,8 @@ const (
 	defaultRemoteName = "origin"
 )
 
+func main() {}
+
 // TempDir holds the directory name of the tmp dir created by NewTempDir().
 // It should probably store the fullpath instead
 type TempDir struct {
