@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	gitSSH "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"golang.org/x/crypto/ssh"
@@ -76,7 +77,6 @@ func (k KeyPath) SetupGitSSHPubKeys() (*gitSSH.PublicKeys, error) {
 
 // GitRepo represents a collection of the git repository name, SSH URL, and the configuration that specifies what file content to change and how
 type GitRepo struct {
-	CommitMsg             string
 	Dir                   string
 	Namespace             string
 	Repo                  *git.Repository
@@ -89,16 +89,33 @@ type GitRepo struct {
 }
 
 // NewGitRepo returns a GitRepo with the minimum configs required for using the struct
-func NewGitRepo(repoDir, repoURL string, sshKey *gitSSH.PublicKeys) GitRepo {
-	return GitRepo{
+func NewGitRepo(commitMsg, initType, repoDir, repoURL string, sshKey *gitSSH.PublicKeys) (gr *GitRepo, err error) {
+	gr = &GitRepo{
 		Dir:    repoDir,
 		SSHKey: sshKey,
 		SSHURL: repoURL,
 	}
+
+	repo := &git.Repository{}
+	if strings.Contains(initType, "init-and-push-main") {
+		repo, err = gr.InitAndPushNewRepo(commitMsg)
+	}
+
+	gr.Repo = repo
+
+	_, err = gr.NewBranch("main", false)
+	if err != nil {
+		return gr, err
+	}
+
+	masterRef := fmt.Sprintf("%s/.git/refs/heads/master", gr.Dir)
+	err = os.Remove(masterRef)
+
+	return gr, err
 }
 
 // Clone uses a given reference name to clone a Git repo
-func (gr GitRepo) Clone(ref plumbing.ReferenceName) (*git.Repository, error) {
+func (gr *GitRepo) Clone(ref plumbing.ReferenceName) (*git.Repository, error) {
 	// Clones the repository into the given dir, just as a normal git clone does
 	repo, err := git.PlainClone(gr.Dir, false, &git.CloneOptions{
 		Auth:          gr.SSHKey,
@@ -109,16 +126,32 @@ func (gr GitRepo) Clone(ref plumbing.ReferenceName) (*git.Repository, error) {
 	return repo, err
 }
 
-// CommitAll staged all changes on the provided Worktree
-func (gr GitRepo) CommitAll(wt *git.Worktree, commitMsg string) (plumbing.Hash, error) {
-	hash, err := wt.Commit(commitMsg, &git.CommitOptions{
+// CommitAll stages all changes on the provided Worktree
+func (gr *GitRepo) CommitAll(commitMsg string) (hash plumbing.Hash, err error) {
+	err = gr.Worktree.AddGlob(".")
+	if err != nil {
+		return hash, err
+	}
+
+	hash, err = gr.Worktree.Commit(commitMsg, &git.CommitOptions{
 		All: true,
 	})
 	return hash, err
 }
 
+// CommitAndPushAll stages all changes on the provided Worktree and pushes to the default remotes of the provided repo
+func (gr *GitRepo) CommitAndPushAll(commitMsg string) error {
+	_, err := gr.CommitAll(commitMsg)
+	if err != nil {
+		return err
+	}
+
+	err = gr.Push()
+	return err
+}
+
 // Init uses the stored git repo directory info to initialize a new repo
-func (gr GitRepo) Init(isBare bool) error {
+func (gr *GitRepo) Init(isBare bool) error {
 	repo, err := git.PlainInit(gr.Dir, isBare)
 	if err != nil {
 		return err
@@ -135,42 +168,61 @@ func (gr GitRepo) Init(isBare bool) error {
 }
 
 // InitAndPushNewRepo does a full init, commit, and push to the main branch
-func (gr GitRepo) InitAndPushNewRepo(commitMsg string) error {
+func (gr *GitRepo) InitAndPushNewRepo(commitMsg string) (*git.Repository, error) {
 	repo, err := git.PlainInit(gr.Dir, false)
 	if err != nil {
-		return err
+		return repo, err
 	}
-	gr.Repo = repo
 
-	_, err = gr.NewBranch("main", false)
+	_, err = repo.CreateRemote(&config.RemoteConfig{
+		Name: defaultRemoteName,
+		URLs: []string{gr.SSHURL},
+	})
 	if err != nil {
-		return err
+		return repo, err
 	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		return repo, err
+	}
+	// fmt.Printf("Worktree root: %s\n", wt.Filesystem.Root())
 
 	initFiles := []string{".gitignore", "CODEOWNERS"}
 	for _, fileName := range initFiles {
 		f := fmt.Sprintf("%s/%s", gr.Dir, fileName)
 		yes, err := fileExists(f)
 		if err != nil {
-			return err
+			return repo, err
 		}
 		if yes {
-			gr.Worktree.Add(f)
+			// fmt.Printf("Staging file: %s\n", fileName)
+			_, err = wt.Add(fileName)
+			if err != nil {
+				return repo, err
+			}
 		}
 	}
 
-	_, err = gr.Worktree.Commit(commitMsg, &git.CommitOptions{All: false})
+	_, err = wt.Commit(commitMsg, &git.CommitOptions{All: false})
 	if err != nil {
-		return err
+		return repo, err
 	}
 
-	err = gr.Push()
+	err = repo.Push(&git.PushOptions{
+		Auth:       gr.SSHKey,
+		RemoteName: defaultRemoteName,
+		RefSpecs:   []config.RefSpec{"refs/heads/master:refs/heads/main"},
+	})
+	if err != nil {
+		return repo, err
+	}
 
-	return err
+	return repo, err
 }
 
 // NewBranch creates a new branch on the provided repo
-func (gr GitRepo) NewBranch(name string, uniqSuffix bool) (string, error) {
+func (gr *GitRepo) NewBranch(name string, uniqSuffix bool) (string, error) {
 	newBranch := strings.Replace(name, " ", "-", -1)
 
 	if uniqSuffix {
@@ -185,19 +237,20 @@ func (gr GitRepo) NewBranch(name string, uniqSuffix bool) (string, error) {
 	if err != nil {
 		return newBranch, err
 	}
-	gr.Worktree = wt
 
-	err = gr.Worktree.Checkout(&git.CheckoutOptions{
+	err = wt.Checkout(&git.CheckoutOptions{
 		Branch: newBranchRefName,
 		Create: true,
 		Keep:   true,
 	})
 
+	gr.Worktree = wt
+
 	return newBranch, err
 }
 
 // Push sends all staged commits to the default remotes of the provided repo
-func (gr GitRepo) Push() error {
+func (gr *GitRepo) Push() error {
 	err := gr.Repo.Push(&git.PushOptions{
 		Auth:       gr.SSHKey,
 		RemoteName: defaultRemoteName,
@@ -208,9 +261,9 @@ func (gr GitRepo) Push() error {
 func fileExists(f string) (bool, error) {
 	_, err := os.Stat(f)
 	if os.IsNotExist(err) {
-		return true, nil
+		return false, nil
 	} else if err != nil {
-		return false, err
+		return true, err
 	}
-	return false, nil
+	return true, nil
 }

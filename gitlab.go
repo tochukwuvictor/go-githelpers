@@ -12,7 +12,14 @@ var (
 	defaultListOpts = gitlab.ListOptions{PerPage: 1000}
 )
 
-func (gr GitRepo) getGitlabGroups() (groups []*gitlab.Group, resp *gitlab.Response, err error) {
+// AddGitlabClient takes a Gitlab token and saves the client to the GitRepo receiver
+func (gr *GitRepo) AddGitlabClient(vcsToken string) error {
+	c, err := gitlab.NewClient(vcsToken)
+	gr.VCSClient = c
+	return err
+}
+
+func (gr *GitRepo) getGitlabGroups() (groups []*gitlab.Group, resp *gitlab.Response, err error) {
 	// Move list groups logic into a new func to DRY out the client declaration and
 	// allow retrieval of a param other than ID
 	client := gr.VCSClient.(*gitlab.Client)
@@ -22,7 +29,7 @@ func (gr GitRepo) getGitlabGroups() (groups []*gitlab.Group, resp *gitlab.Respon
 	return groups, resp, err
 }
 
-func (gr GitRepo) getGitlabGroupID(groupPath string) (id int, resp *gitlab.Response, err error) {
+func (gr *GitRepo) getGitlabGroupID(groupPath string) (id int, resp *gitlab.Response, err error) {
 	groups, resp, err := gr.getGitlabGroups()
 	for _, g := range groups {
 		if g.FullPath == groupPath {
@@ -32,13 +39,18 @@ func (gr GitRepo) getGitlabGroupID(groupPath string) (id int, resp *gitlab.Respo
 	return id, resp, err
 }
 
-func (gr GitRepo) getGitlabProjectID(name, parentGroupPath string) (id int, resp *gitlab.Response, err error) {
+func (gr *GitRepo) getGitlabProjectID(url string) (id int, resp *gitlab.Response, err error) {
 	// Move list projects logic into a new func to DRY out the client declaration and
 	// allow retrieval of a param other than ID
 	client := gr.VCSClient.(*gitlab.Client)
+	_, parentGroupPath, name := splitRepoURL(url)
+
 	parentID, _, err := gr.getGitlabGroupID(parentGroupPath)
+
 	projects, resp, err := client.Groups.ListGroupProjects(parentID, &gitlab.ListGroupProjectsOptions{ListOptions: defaultListOpts})
+
 	for _, p := range projects {
+		// fmt.Printf("Checking whether %s matches %s\n", p.Path, name)
 		if p.Path == name {
 			id = p.ID
 		}
@@ -47,15 +59,20 @@ func (gr GitRepo) getGitlabProjectID(name, parentGroupPath string) (id int, resp
 }
 
 // NewGitlabMergeRequest creates a new MR in Gitlab
-func (gr GitRepo) NewGitlabMergeRequest(src, dest string) (mr *gitlab.MergeRequest, resp *gitlab.Response, err error) {
-	client := gr.VCSClient.(*gitlab.Client)
+func (gr *GitRepo) NewGitlabMergeRequest(commitMsg, src, dest string) (mr *gitlab.MergeRequest, resp *gitlab.Response, err error) {
+	c := gr.VCSClient.(*gitlab.Client)
+
 	mrOpts := &gitlab.CreateMergeRequestOptions{
-		Title:        &gr.CommitMsg,
+		Title:        &commitMsg,
 		SourceBranch: &src,
 		TargetBranch: &dest,
 	}
-	pid, resp, err := gr.getGitlabProjectID(gr.Dir, gr.Namespace)
-	mr, resp, err = client.MergeRequests.CreateMergeRequest(pid, mrOpts)
+	pid, resp, err := gr.getGitlabProjectID(gr.SSHURL)
+	if err != nil {
+		return mr, resp, err
+	}
+
+	mr, resp, err = c.MergeRequests.CreateMergeRequest(pid, mrOpts)
 	return mr, resp, err
 }
 
